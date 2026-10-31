@@ -1,5 +1,7 @@
 # cn-deploy-doctor
 
+> **Series index:** [cn-deploy](https://github.com/fisheeplife-beep/cn-deploy) — Chinese follow-along deployment companions.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **国内环境一键部署体检**：在跟做 GitHub 热门工具 / Docker 自托管教程之前，先摸清本机缺什么。
