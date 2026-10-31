@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# cn-deploy-doctor — 国内环境一键部署体检
+# MIT License
+set -euo pipefail
+
+APP_VERSION="0.1.0"
+LANG_UI="${CN_DEPLOY_LANG:-zh}"
+STRICT=0
+QUIET=0
+JSON_OUT=0
+
+PASS=0
+WARN=0
+FAIL=0
+NOTES=()
+
+usage() {
+  cat <<'U'
+Usage: cn-deploy-doctor [options]
+
+Options:
+  --lang zh|en     UI language (default: zh, or CN_DEPLOY_LANG)
+  --strict         Treat warnings as failures (exit 1 if any warn/fail)
+  --json           Machine-readable summary on stdout
+  -q, --quiet      Only print summary
+  -h, --help       Show help
+  -V, --version    Show version
+U
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --lang) LANG_UI="$2"; shift 2 ;;
+    --strict) STRICT=1; shift ;;
+    --json) JSON_OUT=1; shift ;;
+    -q|--quiet) QUIET=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -V|--version) echo "$APP_VERSION"; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+t() {
+  # t key zh en
+  if [[ "$LANG_UI" == "en" ]]; then echo "$3"; else echo "$2"; fi
+}
+
+say() { [[ $QUIET -eq 1 ]] || printf '%s\n' "$*"; }
+hr() { [[ $QUIET -eq 1 ]] || printf '%s\n' "----------------------------------------"; }
+
+ok()   { PASS=$((PASS+1)); say "  ✅ $1"; }
+warn() { WARN=$((WARN+1)); say "  ⚠️  $1"; NOTES+=("WARN: $1"); }
+bad()  { FAIL=$((FAIL+1)); say "  ❌ $1"; NOTES+=("FAIL: $1"); }
+info() { say "  ℹ️  $1"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+check_os() {
+  hr
+  say "$(t os "【系统】" "[OS]")"
+  local uname_s uname_m
+  uname_s=$(uname -s 2>/dev/null || echo unknown)
+  uname_m=$(uname -m 2>/dev/null || echo unknown)
+  info "$(t os_info "内核: $uname_s / 架构: $uname_m" "Kernel: $uname_s / Arch: $uname_m")"
+  if [[ -f /etc/os-release ]]; then
+    # Avoid clobbering APP_VERSION (os-release defines VERSION=...)
+    local _pretty _name
+    _pretty=$(. /etc/os-release; echo "${PRETTY_NAME:-}")
+    _name=$(. /etc/os-release; echo "${NAME:-}")
+    info "$(t distro "发行版: ${_pretty:-$_name}" "Distro: ${_pretty:-$_name}")"
+  fi
+  if [[ "$uname_m" == "aarch64" || "$uname_m" == "arm64" ]]; then
+    warn "$(t arm "ARM 架构：部分镜像无 arm64 构建，部署前确认 multi-arch" "ARM: some images lack arm64 builds")"
+  else
+    ok "$(t arch_ok "架构常见，兼容性较好" "Common arch, usually fine")"
+  fi
+}
+
+check_disk() {
+  hr
+  say "$(t disk "【磁盘】" "[Disk]")"
+  local avail
+  avail=$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}')
+  if [[ -z "$avail" ]]; then
+    warn "$(t disk_unk "无法读取根分区可用空间" "Cannot read free space on /")"
+    return
+  fi
+  local gb=$((avail / 1024 / 1024))
+  info "$(t disk_free "根分区可用约 ${gb} GiB" "Free on / ≈ ${gb} GiB")"
+  if (( gb < 5 )); then
+    bad "$(t disk_low "可用空间 < 5GiB，拉镜像很容易失败" "Less than 5GiB free — pulls will likely fail")"
+  elif (( gb < 20 )); then
+    warn "$(t disk_mid "可用空间偏紧（<20GiB），大模型/多容器慎用" "Tight disk (<20GiB) for big images")"
+  else
+    ok "$(t disk_ok "磁盘空间充足" "Disk space looks OK")"
+  fi
+}
+
+check_docker() {
+  hr
+  say "$(t docker "【Docker】" "[Docker]")"
+  if ! have docker; then
+    bad "$(t no_docker "未安装 docker。建议: https://docs.docker.com/engine/install/" "docker not found")"
+    return
+  fi
+  ok "$(t docker_bin "已找到 docker: $(docker --version 2>/dev/null | head -1)" "Found docker: $(docker --version 2>/dev/null | head -1)")"
+
+  if docker info >/dev/null 2>&1; then
+    ok "$(t docker_daemon "Docker 守护进程可访问" "Docker daemon reachable")"
+  else
+    bad "$(t docker_daemon_fail "无法访问 Docker 守护进程（权限或服务未启动）。试试: sudo usermod -aG docker \$USER && newgrp docker" "Cannot reach Docker daemon")"
+  fi
+
+  if docker compose version >/dev/null 2>&1; then
+    ok "$(t compose "docker compose: $(docker compose version --short 2>/dev/null || echo ok)" "docker compose OK")"
+  elif have docker-compose; then
+    warn "$(t compose_v1 "仅有旧版 docker-compose，建议升级到 Compose V2 插件" "Legacy docker-compose only; prefer Compose V2")"
+  else
+    bad "$(t no_compose "未找到 docker compose" "docker compose not found")"
+  fi
+}
+
+check_proxy() {
+  hr
+  say "$(t proxy "【代理 / 环境变量】" "[Proxy / env]")"
+  local found=0
+  for v in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy NO_PROXY no_proxy; do
+    if [[ -n "${!v:-}" ]]; then
+      info "$v=${!v}"
+      found=1
+    fi
+  done
+  if (( found == 0 )); then
+    info "$(t no_proxy_env "未设置 HTTP(S)_PROXY（直连环境）" "No HTTP(S)_PROXY set")"
+  else
+    warn "$(t proxy_set "已设置代理：确认 Docker daemon 也配置了同样代理（否则 CLI 通、拉镜像失败）" "Proxy set: also configure Docker daemon proxy")"
+  fi
+}
+
+# return 0 if URL reachable within timeout
+probe() {
+  local url="$1"
+  local timeout="${2:-5}"
+  if have curl; then
+    curl -fsSIL --connect-timeout "$timeout" --max-time "$timeout" "$url" >/dev/null 2>&1
+  elif have wget; then
+    wget -q --spider --timeout="$timeout" "$url" >/dev/null 2>&1
+  else
+    return 2
+  fi
+}
+
+check_network() {
+  hr
+  say "$(t net "【网络连通】" "[Network]")"
+  if ! have curl && ! have wget; then
+    warn "$(t no_curl "未安装 curl/wget，跳过连通性探测" "No curl/wget; skip probes")"
+    return
+  fi
+
+  local targets=(
+    "https://github.com|GitHub"
+    "https://ghcr.io|GHCR"
+    "https://registry-1.docker.io/v2/|Docker Hub"
+    "https://quay.io|Quay"
+    "https://huggingface.co|Hugging Face"
+  )
+
+  local ok_n=0
+  local item host label
+  for item in "${targets[@]}"; do
+    host="${item%%|*}"
+    label="${item##*|}"
+    if probe "$host" 6; then
+      ok "$(t net_ok "$label 可达" "$label reachable")"
+      ok_n=$((ok_n+1))
+    else
+      warn "$(t net_fail "$label 超时/不可达（国内常见）。考虑镜像站或代理" "$label unreachable — use mirror/proxy")"
+    fi
+  done
+
+  if (( ok_n == 0 )); then
+    bad "$(t net_all "关键 registry 全不可达，先解决网络/代理再部署" "No registries reachable")"
+  fi
+}
+
+check_mirrors_hint() {
+  hr
+  say "$(t mirror "【国内镜像建议】" "[China mirror tips]")"
+  info "$(t m1 "Docker Hub 慢/失败 → 配置 registry-mirrors（勿用来路不明的公共镜像）" "Slow Docker Hub → set trusted registry-mirrors")"
+  info "$(t m2 "GitHub Release/raw 慢 → ghproxy / 自建 mirror / 代理" "Slow GitHub assets → proxy or mirror")"
+  info "$(t m3 "pip: 清华/阿里云源；npm: npmmirror；Go: goproxy.cn" "pip/npm/Go: use CN mirrors")"
+  info "$(t m4 "详细步骤见 docs/china-mirrors.md" "See docs/china-mirrors.md")"
+}
+
+check_gpu() {
+  hr
+  say "$(t gpu "【GPU】" "[GPU]")"
+  if have nvidia-smi; then
+    if nvidia-smi >/dev/null 2>&1; then
+      ok "$(t gpu_ok "检测到 NVIDIA GPU" "NVIDIA GPU detected")"
+      info "$(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null | head -3 || true)"
+      if docker info 2>/dev/null | grep -qi nvidia; then
+        ok "$(t nvidia_runtime "Docker 似乎已配置 NVIDIA runtime" "NVIDIA runtime appears configured")"
+      else
+        warn "$(t no_nvidia_rt "未检测到 Docker NVIDIA runtime；GPU 容器可能起不来。见 https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html" "No NVIDIA Docker runtime detected")"
+      fi
+    else
+      warn "$(t nvidia_fail "有 nvidia-smi 但执行失败" "nvidia-smi present but failed")"
+    fi
+  else
+    info "$(t no_gpu "未检测到 nvidia-smi（CPU-only 或非 NVIDIA）。多数工具可无 GPU 跑，只是更慢" "No nvidia-smi (CPU-only or non-NVIDIA)")"
+  fi
+}
+
+check_ports() {
+  hr
+  say "$(t ports "【常见端口占用】" "[Common ports]")"
+  local ports=(ACCT-000019 5432 6379 11434 8080)
+  local p busy=0
+  for p in "${ports[@]}"; do
+    if have ss; then
+      if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]$p\$"; then
+        warn "$(t port_busy "端口 $p 已被占用" "Port $p in use")"
+        busy=1
+      fi
+    elif have lsof; then
+      if lsof -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
+        warn "$(t port_busy "端口 $p 已被占用" "Port $p in use")"
+        busy=1
+      fi
+    else
+      info "$(t no_ss "无 ss/lsof，跳过端口检查" "No ss/lsof; skip port check")"
+      return
+    fi
+  done
+  if (( busy == 0 )); then
+    ok "$(t ports_ok "抽查端口空闲: ${ports[*]}" "Sampled ports free: ${ports[*]}")"
+  fi
+}
+
+check_tools() {
+  hr
+  say "$(t tools "【常用工具】" "[Tools]")"
+  local req=(git curl)
+  local opt=(wget jq make python3 node npm)
+  local r
+  for r in "${req[@]}"; do
+    if have "$r"; then ok "$r"; else bad "$(t miss "缺少 $r" "Missing $r")"; fi
+  done
+  for r in "${opt[@]}"; do
+    if have "$r"; then ok "$r"; else info "$(t opt_miss "可选未装: $r" "Optional missing: $r")"; fi
+  done
+}
+
+print_summary() {
+  hr
+  say "$(t sum "【汇总】 pass=$PASS  warn=$WARN  fail=$FAIL" "[Summary] pass=$PASS  warn=$WARN  fail=$FAIL")"
+  if (( FAIL > 0 )); then
+    say "$(t sum_fail "先修 ❌ 项再部署；完整踩坑文会放在配套专栏/教程里。" "Fix ❌ items before deploy.")"
+  elif (( WARN > 0 )); then
+    say "$(t sum_warn "可以试跑，但建议先处理 ⚠️（尤其网络与镜像）。" "Runnable, but address ⚠️ first (esp. network/mirrors).")"
+  else
+    say "$(t sum_ok "环境看起来可以开始跟做部署教程。" "Environment looks ready for deploy tutorials.")"
+  fi
+}
+
+emit_json() {
+  printf '{"version":"%s","pass":%d,"warn":%d,"fail":%d,"notes":[' "$APP_VERSION" "$PASS" "$WARN" "$FAIL"
+  local i=0
+  local n
+  for n in "${NOTES[@]+"${NOTES[@]}"}"; do
+    [[ $i -gt 0 ]] && printf ','
+    # crude escape
+    n=${n//\\/\\\\}
+    n=${n//\"/\\\"}
+    printf '"%s"' "$n"
+    i=$((i+1))
+  done
+  printf ']}\n'
+}
+
+main() {
+  say "$(t title "cn-deploy-doctor v$APP_VERSION — 国内环境部署体检" "cn-deploy-doctor v$APP_VERSION")"
+  check_os
+  check_disk
+  check_tools
+  check_docker
+  check_proxy
+  check_network
+  check_mirrors_hint
+  check_gpu
+  check_ports
+  print_summary
+  if [[ $JSON_OUT -eq 1 ]]; then emit_json; fi
+  if (( FAIL > 0 )); then exit 1; fi
+  if [[ $STRICT -eq 1 && $WARN -gt 0 ]]; then exit 1; fi
+  exit 0
+}
+
+main
