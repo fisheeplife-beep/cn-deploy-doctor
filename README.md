@@ -71,3 +71,18 @@ One-shot **pre-deploy health check** for machines that struggle with Docker Hub 
 ```
 
 See table above for checks. MIT licensed.
+
+## 示例输出
+
+见 [`examples/sample-output.txt`](./examples/sample-output.txt)。在本机再跑一遍：
+
+```bash
+./bin/cn-deploy-doctor | tee doctor.log
+```
+
+## 路线图
+
+- [x] v0.1 基础体检（Docker / 网络 / GPU / 端口）
+- [ ] JSON schema 稳定化，方便 CI 接入
+- [ ] 可选：生成「给教程作者看的环境报告」Markdown
+- [ ] 姊妹项目：Trending 中文部署缺口雷达（选题用）
